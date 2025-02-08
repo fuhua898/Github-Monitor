@@ -137,12 +137,20 @@ class GitHubMonitor:
             return []
 
     def check_user_updates(self, username: str):
-        """检查单个用户的更新"""
+        """检查单个用户的更新，包括新仓库和现有仓库的更新"""
         try:
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{current_time}] 正在检查用户 {username} 的仓库更新...")
+            print(f"[{current_time}] 正在检查用户 {username} 的活动...")
             
-            # 获取用户的所有仓库
+            # 首先检查新建仓库
+            notifications = self.check_user_activity(username)
+            for subject, content in notifications:
+                self.notification_queue.put({
+                    'subject': subject,
+                    'content': content
+                })
+            
+            # 然后检查现有仓库的更新
             current_repos = self.get_user_repos(username)
             updates_found = False
             
@@ -215,32 +223,48 @@ class GitHubMonitor:
         notification_thread = threading.Thread(target=self.notification_sender, daemon=True)
         notification_thread.start()
 
-        status_interval = 1800  # 每30分钟显示一次状态
+        status_interval = 900  # 每15分钟显示一次状态（900秒）
         last_status_time = time.time()
+        last_check_time = time.time()
 
         while True:
             try:
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
-                # 每30分钟显示运行状态
+                # 每15分钟显示运行状态
                 if time.time() - last_status_time >= status_interval:
-                    print(f"[{current_time}] 监控程序正在运行中...")
+                    print(f"\n[{current_time}] 监控程序正在运行中...")
+                    print(f"监控用户: {', '.join(usernames)}")
+                    
+                    # 计算下次检查时间
+                    next_check_time = datetime.fromtimestamp(last_check_time + check_interval)
+                    time_until_next_check = (next_check_time - datetime.now()).total_seconds()
+                    if time_until_next_check > 0:
+                        next_check_str = next_check_time.strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"下次检查时间: {next_check_str} (约 {int(time_until_next_check/60)} 分钟后)")
+                    
                     last_status_time = time.time()
 
-                # 为每个用户创建检查线程
-                threads = []
-                for username in usernames:
-                    thread = threading.Thread(target=self.check_user_updates, args=(username,))
-                    threads.append(thread)
-                    thread.start()
+                # 检查是否到达检查间隔时间
+                if time.time() - last_check_time >= check_interval:
+                    print(f"\n[{current_time}] 开始新一轮检查...")
+                    
+                    # 为每个用户创建检查线程
+                    threads = []
+                    for username in usernames:
+                        thread = threading.Thread(target=self.check_user_updates, args=(username,))
+                        threads.append(thread)
+                        thread.start()
 
-                # 等待所有线程完成
-                for thread in threads:
-                    thread.join()
+                    # 等待所有线程完成
+                    for thread in threads:
+                        thread.join()
 
-                print(f"[{current_time}] 本轮检查完成，等待下一次检查...")
-                # 等待指定时间后再次检查
-                time.sleep(check_interval)
+                    print(f"[{current_time}] 本轮检查完成")
+                    last_check_time = time.time()
+                
+                # 短暂休眠以减少CPU使用
+                time.sleep(60)
                 
             except Exception as e:
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
