@@ -83,10 +83,23 @@ class GitHubMonitor:
         
         try:
             response = self.session.get(url, params=params)
+            
+            # 处理特定的错误状态码
+            if response.status_code == 409:  # Conflict - 通常意味着空仓库
+                print(f"{Colors.YELLOW}仓库 {repo} 是空仓库{Colors.ENDC}")
+                return []
+            elif response.status_code == 403:  # Forbidden - 可能是访问权限问题
+                print(f"{Colors.YELLOW}无权限访问仓库 {repo} 的提交记录{Colors.ENDC}")
+                return []
+            elif response.status_code == 404:  # Not Found
+                print(f"{Colors.YELLOW}仓库 {repo} 不存在或已被删除{Colors.ENDC}")
+                return []
+            
             response.raise_for_status()
             return response.json()
-        except Exception as e:
-            print(f"{Colors.RED}获取仓库 {repo} 提交记录时出错: {str(e)}{Colors.ENDC}")
+        except requests.exceptions.RequestException as e:
+            if not any(code in str(e) for code in ['409', '403', '404']):  # 避免重复打印已处理的错误
+                print(f"{Colors.RED}获取仓库 {repo} 提交记录时出错: {str(e)}{Colors.ENDC}")
             return []
 
     def send_email(self, subject: str, content: str):
@@ -162,16 +175,24 @@ class GitHubMonitor:
             
             # 获取已知的仓库列表
             if username not in self.known_repos:
-                self.known_repos[username] = {repo['name']: {
-                    'created_at': repo['created_at'],
-                    'description': repo['description'],
-                    'html_url': repo['html_url'],
-                    'topics': repo.get('topics', []),
-                    'language': repo.get('language', 'Unknown'),
-                    'stars': repo.get('stargazers_count', 0),
-                    'last_commit': None  # 添加最后提交时间记录
-                } for repo in current_repos}
-                print(f"{Colors.BLUE}首次运行，记录用户 {Colors.YELLOW}{username}{Colors.ENDC} {Colors.BLUE}的 {len(current_repos)} 个仓库{Colors.ENDC}")
+                self.known_repos[username] = {}
+                print(f"{Colors.BLUE}首次运行，记录用户 {Colors.YELLOW}{username}{Colors.ENDC} {Colors.BLUE}的仓库{Colors.ENDC}")
+                
+                # 初始化时获取每个仓库的信息
+                for repo in current_repos:
+                    repo_name = repo['name']
+                    # 检查仓库是否可访问
+                    commits = self.get_repo_commits(username, repo_name, limit=1)
+                    self.known_repos[username][repo_name] = {
+                        'created_at': repo['created_at'],
+                        'description': repo['description'],
+                        'html_url': repo['html_url'],
+                        'topics': repo.get('topics', []),
+                        'language': repo.get('language', 'Unknown'),
+                        'stars': repo.get('stargazers_count', 0),
+                        'last_commit': commits[0]['commit']['author']['date'] if commits else None,
+                        'is_empty': len(commits) == 0
+                    }
                 return []
             
             # 检查新仓库和更新
@@ -199,26 +220,32 @@ class GitHubMonitor:
                             'topics': repo.get('topics', []),
                             'language': repo.get('language', 'Unknown'),
                             'stars': repo.get('stargazers_count', 0),
-                            'last_commit': None
+                            'last_commit': None,
+                            'is_empty': False
                         }
+                        continue  # 新仓库不需要检查更新
                     
-                    # 检查仓库更新
-                    commits = self.get_repo_commits(username, repo_name, limit=1)
+                    # 检查仓库更新，使用上次记录的提交时间
+                    last_commit_time = self.known_repos[username][repo_name]['last_commit']
+                    commits = self.get_repo_commits(username, repo_name, since=last_commit_time, limit=5)
+                    
                     if commits and isinstance(commits, list) and len(commits) > 0:
+                        # 检查最新提交是否比记录的更新
                         latest_commit = commits[0]
                         latest_commit_time = latest_commit['commit']['author']['date']
                         
-                        if (self.known_repos[username][repo_name]['last_commit'] is None or 
-                            latest_commit_time > self.known_repos[username][repo_name]['last_commit']):
+                        if last_commit_time is None or latest_commit_time > last_commit_time:
+                            # 只有真正有新提交时才添加到更新列表
                             updated_repos.append({
                                 'name': repo_name,
                                 'commit': latest_commit,
                                 'html_url': repo['html_url']
                             })
+                            # 更新最后提交时间
                             self.known_repos[username][repo_name]['last_commit'] = latest_commit_time
                 except Exception as e:
                     print(f"{Colors.RED}检查仓库 {repo_name} 时出错: {str(e)}{Colors.ENDC}")
-                    continue  # 继续检查下一个仓库
+                    continue
             
             # 处理新仓库通知
             if new_repos:
