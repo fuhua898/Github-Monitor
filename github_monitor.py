@@ -332,7 +332,7 @@ class GitHubMonitor:
         print(f"\n[{Colors.GREEN}{current_time}{Colors.ENDC}] {Colors.BLUE}开始监控以下用户:{Colors.ENDC}")
         for username in usernames:
             print(f"- {Colors.YELLOW}{username}{Colors.ENDC}")
-        print(f"{Colors.BLUE}检查间隔: 30分钟{Colors.ENDC}")
+        print(f"{Colors.BLUE}检查间隔: {check_interval}秒{Colors.ENDC}")
         print(f"{Colors.BLUE}程序已成功启动...{Colors.ENDC}\n")
         
         # 初始化所有用户的最后检查时间
@@ -368,9 +368,12 @@ class GitHubMonitor:
                     # 计算下次检查时间
                     next_check_time = datetime.fromtimestamp(last_check_time + check_interval)
                     time_until_next_check = (next_check_time - datetime.now()).total_seconds()
-                    minutes_until_next_check = int(time_until_next_check / 60)
-                    print(f"{Colors.BLUE}距离下次检查还有: {Colors.YELLOW}{minutes_until_next_check}{Colors.ENDC} 分钟")
+                    hours = int(time_until_next_check // 3600)
+                    minutes = int((time_until_next_check % 3600) // 60)
+                    seconds = int(time_until_next_check % 60)
+                    
                     print(f"{Colors.BLUE}下次检查时间: {Colors.YELLOW}{next_check_time.strftime('%Y-%m-%d %H:%M:%S')}{Colors.ENDC}")
+                    print(f"{Colors.BLUE}距离下次检查还有: {Colors.YELLOW}{hours:02d}:{minutes:02d}:{seconds:02d}{Colors.ENDC}")
                     print(f"{Colors.BLUE}程序运行正常...{Colors.ENDC}\n")
                     
                     last_status_time = time.time()
@@ -382,10 +385,17 @@ class GitHubMonitor:
                     last_check_time = time.time()
                     next_check_time = datetime.fromtimestamp(last_check_time + check_interval)
                     print(f"[{Colors.GREEN}{current_time}{Colors.ENDC}] {Colors.BLUE}本轮检查完成{Colors.ENDC}")
-                    print(f"{Colors.BLUE}下次检查时间: {Colors.YELLOW}{next_check_time.strftime('%Y-%m-%d %H:%M:%S')}{Colors.ENDC}\n")
+                    print(f"{Colors.BLUE}下次检查时间: {Colors.YELLOW}{next_check_time.strftime('%Y-%m-%d %H:%M:%S')}{Colors.ENDC}")
+                    
+                    # 显示初始倒计时
+                    time_until_next_check = check_interval
+                    hours = int(time_until_next_check // 3600)
+                    minutes = int((time_until_next_check % 3600) // 60)
+                    seconds = int(time_until_next_check % 60)
+                    print(f"{Colors.BLUE}距离下次检查还有: {Colors.YELLOW}{hours:02d}:{minutes:02d}:{seconds:02d}{Colors.ENDC}\n")
                 
                 # 短暂休眠以减少CPU使用
-                time.sleep(10)  # 改为10秒检查一次，使输出更及时
+                time.sleep(10)
                 
             except Exception as e:
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
