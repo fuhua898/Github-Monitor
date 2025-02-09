@@ -30,6 +30,41 @@ class GitHubMonitor:
         self.last_check = {}  # 存储上次检查时间
         self.known_repos = {}  # 存储已知的仓库列表
         self.notification_queue = Queue()  # 用于存储需要发送的通知
+        self.update_file = 'update.json'  # 添加更新记录文件
+        self.load_update_history()  # 加载历史更新记录
+
+    def load_update_history(self):
+        """加载历史更新记录"""
+        try:
+            if os.path.exists(self.update_file):
+                with open(self.update_file, 'r', encoding='utf-8') as f:
+                    self.update_history = json.load(f)
+            else:
+                self.update_history = []
+        except Exception as e:
+            print(f"{Colors.RED}加载更新历史记录失败: {str(e)}{Colors.ENDC}")
+            self.update_history = []
+
+    def save_update(self, update_info):
+        """保存更新信息到JSON文件"""
+        try:
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            update_record = {
+                'timestamp': current_time,
+                'subject': update_info['subject'],
+                'content': update_info['content']
+            }
+            
+            # 添加新的更新记录
+            self.update_history.append(update_record)
+            
+            # 保存到文件
+            with open(self.update_file, 'w', encoding='utf-8') as f:
+                json.dump(self.update_history, f, ensure_ascii=False, indent=2)
+            
+            print(f"{Colors.BLUE}更新信息已保存到 {Colors.YELLOW}{self.update_file}{Colors.ENDC}")
+        except Exception as e:
+            print(f"{Colors.RED}保存更新信息失败: {str(e)}{Colors.ENDC}")
 
     def get_user_repos(self, username: str) -> List[Dict]:
         """获取用户的所有仓库"""
@@ -37,12 +72,22 @@ class GitHubMonitor:
         response = self.session.get(url)
         return response.json()
 
-    def get_repo_commits(self, username: str, repo: str, since: str = None) -> List[Dict]:
+    def get_repo_commits(self, username: str, repo: str, since: str = None, limit: int = None) -> List[Dict]:
         """获取仓库的提交记录"""
         url = f'https://api.github.com/repos/{username}/{repo}/commits'
-        params = {'since': since} if since else {}
-        response = self.session.get(url, params=params)
-        return response.json()
+        params = {}
+        if since:
+            params['since'] = since
+        if limit:
+            params['per_page'] = limit
+        
+        try:
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"{Colors.RED}获取仓库 {repo} 提交记录时出错: {str(e)}{Colors.ENDC}")
+            return []
 
     def send_email(self, subject: str, content: str):
         """发送邮件通知"""
@@ -107,12 +152,13 @@ class GitHubMonitor:
             raise
 
     def check_user_activity(self, username):
-        """检查用户活动，包括新建仓库"""
+        """检查用户活动，包括新建仓库和更新"""
         api_url = f"https://api.github.com/users/{username}/repos"
         try:
             response = self.session.get(api_url)
             response.raise_for_status()
             current_repos = response.json()
+            notifications = []
             
             # 获取已知的仓库列表
             if username not in self.known_repos:
@@ -122,34 +168,60 @@ class GitHubMonitor:
                     'html_url': repo['html_url'],
                     'topics': repo.get('topics', []),
                     'language': repo.get('language', 'Unknown'),
-                    'stars': repo.get('stargazers_count', 0)
+                    'stars': repo.get('stargazers_count', 0),
+                    'last_commit': None  # 添加最后提交时间记录
                 } for repo in current_repos}
-                return []  # 首次运行，记录现有仓库但不发送通知
+                print(f"{Colors.BLUE}首次运行，记录用户 {Colors.YELLOW}{username}{Colors.ENDC} {Colors.BLUE}的 {len(current_repos)} 个仓库{Colors.ENDC}")
+                return []
             
-            # 检查新仓库
+            # 检查新仓库和更新
             new_repos = []
-            for repo in current_repos:
-                if repo['name'] not in self.known_repos[username]:
-                    new_repos.append({
-                        'name': repo['name'],
-                        'created_at': repo['created_at'],
-                        'description': repo['description'],
-                        'html_url': repo['html_url'],
-                        'topics': repo.get('topics', []),
-                        'language': repo.get('language', 'Unknown'),
-                        'stars': repo.get('stargazers_count', 0)
-                    })
-                    self.known_repos[username][repo['name']] = {
-                        'created_at': repo['created_at'],
-                        'description': repo['description'],
-                        'html_url': repo['html_url'],
-                        'topics': repo.get('topics', []),
-                        'language': repo.get('language', 'Unknown'),
-                        'stars': repo.get('stargazers_count', 0)
-                    }
+            updated_repos = []
             
+            for repo in current_repos:
+                try:
+                    repo_name = repo['name']
+                    # 检查新仓库
+                    if repo_name not in self.known_repos[username]:
+                        new_repos.append({
+                            'name': repo_name,
+                            'created_at': repo['created_at'],
+                            'description': repo['description'],
+                            'html_url': repo['html_url'],
+                            'topics': repo.get('topics', []),
+                            'language': repo.get('language', 'Unknown'),
+                            'stars': repo.get('stargazers_count', 0)
+                        })
+                        self.known_repos[username][repo_name] = {
+                            'created_at': repo['created_at'],
+                            'description': repo['description'],
+                            'html_url': repo['html_url'],
+                            'topics': repo.get('topics', []),
+                            'language': repo.get('language', 'Unknown'),
+                            'stars': repo.get('stargazers_count', 0),
+                            'last_commit': None
+                        }
+                    
+                    # 检查仓库更新
+                    commits = self.get_repo_commits(username, repo_name, limit=1)
+                    if commits and isinstance(commits, list) and len(commits) > 0:
+                        latest_commit = commits[0]
+                        latest_commit_time = latest_commit['commit']['author']['date']
+                        
+                        if (self.known_repos[username][repo_name]['last_commit'] is None or 
+                            latest_commit_time > self.known_repos[username][repo_name]['last_commit']):
+                            updated_repos.append({
+                                'name': repo_name,
+                                'commit': latest_commit,
+                                'html_url': repo['html_url']
+                            })
+                            self.known_repos[username][repo_name]['last_commit'] = latest_commit_time
+                except Exception as e:
+                    print(f"{Colors.RED}检查仓库 {repo_name} 时出错: {str(e)}{Colors.ENDC}")
+                    continue  # 继续检查下一个仓库
+            
+            # 处理新仓库通知
             if new_repos:
-                # 构建新仓库通知
                 notification = f"GitHub用户 {username} 创建了新的仓库\n"
                 notification += "=" * 50 + "\n\n"
                 
@@ -164,12 +236,25 @@ class GitHubMonitor:
                     notification += f"仓库地址: {repo['html_url']}\n"
                     notification += "-" * 40 + "\n\n"
                 
-                return [(f"GitHub通知: {username} 创建了 {len(new_repos)} 个新仓库", notification)]
+                notifications.append((f"GitHub通知: {username} 创建了 {len(new_repos)} 个新仓库", notification))
             
-            return []
+            # 处理更新通知
+            if updated_repos:
+                for repo in updated_repos:
+                    commit = repo['commit']
+                    notification = f"仓库 {repo['name']} 有新的更新:\n\n"
+                    notification += f"提交信息: {commit['commit']['message']}\n"
+                    notification += f"提交者: {commit['commit']['author']['name']}\n"
+                    notification += f"提交时间: {commit['commit']['author']['date']}\n"
+                    notification += f"仓库地址: {repo['html_url']}\n"
+                    notification += "-" * 40 + "\n"
+                    
+                    notifications.append((f"GitHub更新通知 - {username}/{repo['name']}", notification))
+            
+            return notifications
             
         except Exception as e:
-            print(f"检查用户 {username} 活动时出错: {str(e)}")
+            print(f"{Colors.RED}检查用户 {username} 活动时出错: {str(e)}{Colors.ENDC}")
             return []
 
     def check_user_updates(self, username: str):
@@ -178,58 +263,26 @@ class GitHubMonitor:
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"[{Colors.GREEN}{current_time}{Colors.ENDC}] {Colors.BLUE}正在检查用户 {Colors.YELLOW}{username}{Colors.ENDC} {Colors.BLUE}的活动...{Colors.ENDC}")
             
-            # 首先检查新建仓库
+            # 检查新建仓库和更新
             notifications = self.check_user_activity(username)
+            
+            # 处理所有通知
             for subject, content in notifications:
-                self.notification_queue.put({
+                update_info = {
                     'subject': subject,
                     'content': content
-                })
-            
-            # 然后检查现有仓库的更新
-            current_repos = self.get_user_repos(username)
-            updates_found = False
-            
-            for repo in current_repos:
-                try:
-                    repo_name = repo['name']
-                    # 获取新的提交
-                    commits = self.get_repo_commits(username, repo_name, self.last_check.get(username))
-                    
-                    if isinstance(commits, list) and commits:  # 确保commits是列表且非空
-                        updates_found = True
-                        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        print(f"[{Colors.GREEN}{current_time}{Colors.ENDC}] {Colors.BLUE}检测到 {Colors.YELLOW}{username}/{repo_name}{Colors.ENDC} {Colors.BLUE}有新的更新！{Colors.ENDC}")
-                        
-                        # 构建邮件内容
-                        content = f"仓库 {repo_name} 有新的提交:\n\n"
-                        for commit in commits:
-                            if isinstance(commit, dict) and 'commit' in commit:
-                                commit_data = commit['commit']
-                                commit_msg = commit_data.get('message', 'No message')
-                                commit_author = commit_data.get('author', {}).get('name', 'Unknown')
-                                commit_date = commit_data.get('author', {}).get('date', 'Unknown date')
-                                content += f"作者: {commit_author}\n"
-                                content += f"时间: {commit_date}\n"
-                                content += f"信息: {commit_msg}\n"
-                                content += "-" * 50 + "\n"
-                        
-                        # 将通知加入队列
-                        self.notification_queue.put({
-                            'subject': f"GitHub更新通知 - {username}/{repo_name}",
-                            'content': content
-                        })
-                except Exception as e:
-                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"[{Colors.GREEN}{current_time}{Colors.ENDC}] {Colors.RED}检查仓库 {repo_name} 时出错: {str(e)}{Colors.ENDC}")
-                    continue
-            
-            if not updates_found:
-                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{Colors.GREEN}{current_time}{Colors.ENDC}] {Colors.BLUE}用户 {Colors.YELLOW}{username}{Colors.ENDC} {Colors.BLUE}的仓库没有新的更新{Colors.ENDC}")
+                }
+                # 保存到JSON文件
+                self.save_update(update_info)
+                # 加入邮件队列
+                self.notification_queue.put(update_info)
             
             # 更新最后检查时间
             self.last_check[username] = datetime.now(timezone.utc).isoformat()
+            
+            if not notifications:
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{Colors.GREEN}{current_time}{Colors.ENDC}] {Colors.BLUE}用户 {Colors.YELLOW}{username}{Colors.ENDC} {Colors.BLUE}没有新的更新{Colors.ENDC}")
             
         except Exception as e:
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
