@@ -26,12 +26,53 @@ class GitHubMonitor:
         self.session = requests.Session()
         if token:
             self.session.headers.update({'Authorization': f'token {token}'})
+            # 验证 token
+            try:
+                response = self.session.get('https://api.github.com/user')
+                if response.status_code == 200:
+                    print(f"{Colors.GREEN}GitHub Token 验证成功{Colors.ENDC}")
+                else:
+                    print(f"{Colors.RED}GitHub Token 可能无效: {response.status_code}{Colors.ENDC}")
+            except Exception as e:
+                print(f"{Colors.RED}验证 GitHub Token 时出错: {str(e)}{Colors.ENDC}")
         self.email_config = email_config
-        self.last_check = {}  # 存储上次检查时间
-        self.known_repos = {}  # 存储已知的仓库列表
-        self.notification_queue = Queue()  # 用于存储需要发送的通知
-        self.update_file = 'update.json'  # 添加更新记录文件
-        self.load_update_history()  # 加载历史更新记录
+        self.last_check = {}
+        self.known_repos = {}
+        self.notification_queue = Queue()
+        self.update_file = 'update.json'
+        self.state_file = 'monitor_state.json'
+        self.inaccessible_repos = {}  # 新增：记录无法访问的仓库
+        self.load_state()  # 加载上次的状态
+
+    def load_state(self):
+        """加载上次保存的监控状态"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r', encoding='utf-8') as f:
+                    state = json.load(f)
+                    self.known_repos = state.get('repos', {})
+                    self.last_check = state.get('last_check', {})
+                    self.inaccessible_repos = state.get('inaccessible_repos', {})  # 加载无法访问的仓库记录
+                    print(f"{Colors.BLUE}已加载上次的监控状态{Colors.ENDC}")
+            else:
+                print(f"{Colors.BLUE}未找到历史状态，将创建新的监控状态{Colors.ENDC}")
+        except Exception as e:
+            print(f"{Colors.RED}加载状态文件失败: {str(e)}{Colors.ENDC}")
+
+    def save_state(self):
+        """保存当前的监控状态"""
+        try:
+            state = {
+                'repos': self.known_repos,
+                'last_check': self.last_check,
+                'inaccessible_repos': self.inaccessible_repos,  # 保存无法访问的仓库记录
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            with open(self.state_file, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            print(f"{Colors.BLUE}已保存当前监控状态{Colors.ENDC}")
+        except Exception as e:
+            print(f"{Colors.RED}保存状态文件失败: {str(e)}{Colors.ENDC}")
 
     def load_update_history(self):
         """加载历史更新记录"""
@@ -69,8 +110,20 @@ class GitHubMonitor:
     def get_user_repos(self, username: str) -> List[Dict]:
         """获取用户的所有仓库"""
         url = f'https://api.github.com/users/{username}/repos'
-        response = self.session.get(url)
-        return response.json()
+        try:
+            response = self.session.get(url)
+            
+            # 添加详细的错误信息输出
+            if response.status_code != 200:
+                print(f"{Colors.RED}获取用户 {username} 仓库失败:")
+                print(f"状态码: {response.status_code}")
+                print(f"响应内容: {response.text}{Colors.ENDC}")
+                return []
+            
+            return response.json()
+        except Exception as e:
+            print(f"{Colors.RED}获取用户 {username} 仓库时出错: {str(e)}{Colors.ENDC}")
+            return []
 
     def get_repo_commits(self, username: str, repo: str, since: str = None, limit: int = None) -> List[Dict]:
         """获取仓库的提交记录"""
@@ -84,22 +137,14 @@ class GitHubMonitor:
         try:
             response = self.session.get(url, params=params)
             
-            # 处理特定的错误状态码
-            if response.status_code == 409:  # Conflict - 通常意味着空仓库
-                print(f"{Colors.YELLOW}仓库 {repo} 是空仓库{Colors.ENDC}")
-                return []
-            elif response.status_code == 403:  # Forbidden - 可能是访问权限问题
-                print(f"{Colors.YELLOW}无权限访问仓库 {repo} 的提交记录{Colors.ENDC}")
-                return []
-            elif response.status_code == 404:  # Not Found
-                print(f"{Colors.YELLOW}仓库 {repo} 不存在或已被删除{Colors.ENDC}")
+            # 只在出错时显示详细信息
+            if response.status_code != 200:
+                print(f"{Colors.RED}获取仓库 {repo} 提交记录失败 (状态码: {response.status_code}){Colors.ENDC}")
                 return []
             
-            response.raise_for_status()
             return response.json()
-        except requests.exceptions.RequestException as e:
-            if not any(code in str(e) for code in ['409', '403', '404']):  # 避免重复打印已处理的错误
-                print(f"{Colors.RED}获取仓库 {repo} 提交记录时出错: {str(e)}{Colors.ENDC}")
+        except Exception as e:
+            print(f"{Colors.RED}获取仓库 {repo} 提交记录时出错{Colors.ENDC}")
             return []
 
     def send_email(self, subject: str, content: str):
@@ -166,122 +211,71 @@ class GitHubMonitor:
 
     def check_user_activity(self, username):
         """检查用户活动，包括新建仓库和更新"""
-        api_url = f"https://api.github.com/users/{username}/repos"
         try:
-            response = self.session.get(api_url)
-            response.raise_for_status()
+            response = self.session.get(f"https://api.github.com/users/{username}/repos")
+            if response.status_code != 200:
+                return []
+                
             current_repos = response.json()
             notifications = []
             
-            # 获取已知的仓库列表
-            if username not in self.known_repos:
-                self.known_repos[username] = {}
-                print(f"{Colors.BLUE}首次运行，记录用户 {Colors.YELLOW}{username}{Colors.ENDC} {Colors.BLUE}的仓库{Colors.ENDC}")
+            # 确保用户的无法访问仓库记录存在
+            if username not in self.inaccessible_repos:
+                self.inaccessible_repos[username] = []
+            
+            # 获取当前所有仓库的最新状态
+            current_state = {}
+            for repo in current_repos:
+                repo_name = repo['name']
                 
-                # 初始化时获取每个仓库的信息
-                for repo in current_repos:
-                    repo_name = repo['name']
-                    # 检查仓库是否可访问
-                    commits = self.get_repo_commits(username, repo_name, limit=1)
-                    self.known_repos[username][repo_name] = {
+                # 跳过已知无法访问的仓库
+                if repo_name in self.inaccessible_repos[username]:
+                    continue
+                
+                commits = self.get_repo_commits(username, repo_name, limit=1)
+                if commits is None:  # 如果获取失败
+                    self.inaccessible_repos[username].append(repo_name)
+                    continue
+                
+                if commits and commits[0]:
+                    current_state[repo_name] = {
                         'created_at': repo['created_at'],
-                        'description': repo['description'],
-                        'html_url': repo['html_url'],
-                        'topics': repo.get('topics', []),
-                        'language': repo.get('language', 'Unknown'),
-                        'stars': repo.get('stargazers_count', 0),
-                        'last_commit': commits[0]['commit']['author']['date'] if commits else None,
-                        'is_empty': len(commits) == 0
+                        'last_commit': commits[0]['commit']['author']['date'],
+                        'html_url': repo['html_url']
                     }
+            
+            # 首次运行时，只记录状态不发送通知
+            if username not in self.known_repos:
+                print(f"{Colors.BLUE}首次运行，记录用户 {username} 的初始状态{Colors.ENDC}")
+                self.known_repos[username] = current_state
+                self.save_state()
                 return []
             
-            # 检查新仓库和更新
-            new_repos = []
-            updated_repos = []
+            # 对比状态并生成通知
+            for repo_name, repo_state in current_state.items():
+                # 检查新仓库
+                if repo_name not in self.known_repos[username]:
+                    notifications.append((
+                        f"GitHub通知: {username} 创建了新仓库 {repo_name}",
+                        f"新仓库信息:\n仓库名称: {repo_name}\n创建时间: {repo_state['created_at']}\n仓库地址: {repo_state['html_url']}"
+                    ))
+                # 检查更新
+                elif (repo_state['last_commit'] and 
+                      self.known_repos[username][repo_name].get('last_commit') and 
+                      repo_state['last_commit'] > self.known_repos[username][repo_name]['last_commit']):
+                    notifications.append((
+                        f"GitHub更新通知: {username}/{repo_name}",
+                        f"仓库有新的更新\n仓库地址: {repo_state['html_url']}\n最新提交时间: {repo_state['last_commit']}"
+                    ))
             
-            for repo in current_repos:
-                try:
-                    repo_name = repo['name']
-                    # 检查新仓库
-                    if repo_name not in self.known_repos[username]:
-                        new_repos.append({
-                            'name': repo_name,
-                            'created_at': repo['created_at'],
-                            'description': repo['description'],
-                            'html_url': repo['html_url'],
-                            'topics': repo.get('topics', []),
-                            'language': repo.get('language', 'Unknown'),
-                            'stars': repo.get('stargazers_count', 0)
-                        })
-                        self.known_repos[username][repo_name] = {
-                            'created_at': repo['created_at'],
-                            'description': repo['description'],
-                            'html_url': repo['html_url'],
-                            'topics': repo.get('topics', []),
-                            'language': repo.get('language', 'Unknown'),
-                            'stars': repo.get('stargazers_count', 0),
-                            'last_commit': None,
-                            'is_empty': False
-                        }
-                        continue  # 新仓库不需要检查更新
-                    
-                    # 检查仓库更新，使用上次记录的提交时间
-                    last_commit_time = self.known_repos[username][repo_name]['last_commit']
-                    commits = self.get_repo_commits(username, repo_name, since=last_commit_time, limit=5)
-                    
-                    if commits and isinstance(commits, list) and len(commits) > 0:
-                        # 检查最新提交是否比记录的更新
-                        latest_commit = commits[0]
-                        latest_commit_time = latest_commit['commit']['author']['date']
-                        
-                        if last_commit_time is None or latest_commit_time > last_commit_time:
-                            # 只有真正有新提交时才添加到更新列表
-                            updated_repos.append({
-                                'name': repo_name,
-                                'commit': latest_commit,
-                                'html_url': repo['html_url']
-                            })
-                            # 更新最后提交时间
-                            self.known_repos[username][repo_name]['last_commit'] = latest_commit_time
-                except Exception as e:
-                    print(f"{Colors.RED}检查仓库 {repo_name} 时出错: {str(e)}{Colors.ENDC}")
-                    continue
-            
-            # 处理新仓库通知
-            if new_repos:
-                notification = f"GitHub用户 {username} 创建了新的仓库\n"
-                notification += "=" * 50 + "\n\n"
-                
-                for repo in new_repos:
-                    notification += f"仓库名称: {repo['name']}\n"
-                    notification += f"创建时间: {repo['created_at']}\n"
-                    notification += f"主要语言: {repo['language']}\n"
-                    notification += f"描述: {repo['description'] or '无描述'}\n"
-                    if repo['topics']:
-                        notification += f"标签: {', '.join(repo['topics'])}\n"
-                    notification += f"Star数: {repo['stars']}\n"
-                    notification += f"仓库地址: {repo['html_url']}\n"
-                    notification += "-" * 40 + "\n\n"
-                
-                notifications.append((f"GitHub通知: {username} 创建了 {len(new_repos)} 个新仓库", notification))
-            
-            # 处理更新通知
-            if updated_repos:
-                for repo in updated_repos:
-                    commit = repo['commit']
-                    notification = f"仓库 {repo['name']} 有新的更新:\n\n"
-                    notification += f"提交信息: {commit['commit']['message']}\n"
-                    notification += f"提交者: {commit['commit']['author']['name']}\n"
-                    notification += f"提交时间: {commit['commit']['author']['date']}\n"
-                    notification += f"仓库地址: {repo['html_url']}\n"
-                    notification += "-" * 40 + "\n"
-                    
-                    notifications.append((f"GitHub更新通知 - {username}/{repo['name']}", notification))
+            # 更新状态
+            self.known_repos[username] = current_state
+            self.save_state()
             
             return notifications
             
         except Exception as e:
-            print(f"{Colors.RED}检查用户 {username} 活动时出错: {str(e)}{Colors.ENDC}")
+            print(f"{Colors.RED}检查用户 {username} 时出错: {str(e)}{Colors.ENDC}")
             return []
 
     def check_user_updates(self, username: str):
@@ -413,4 +407,49 @@ class GitHubMonitor:
 
         # 等待所有线程完成
         for thread in threads:
-            thread.join() 
+            thread.join()
+
+    def check_rate_limit(self):
+        """检查 API 速率限制"""
+        try:
+            response = self.session.get('https://api.github.com/rate_limit')
+            if response.status_code == 200:
+                limits = response.json()
+                core_limit = limits['resources']['core']
+                remaining = core_limit['remaining']
+                limit = core_limit['limit']
+                reset_time = datetime.fromtimestamp(core_limit['reset']).strftime('%Y-%m-%d %H:%M:%S')
+                
+                print(f"\n{Colors.BLUE}API 速率限制状态:{Colors.ENDC}")
+                print(f"剩余请求次数: {remaining}/{limit}")
+                print(f"重置时间: {reset_time}")
+                
+                if remaining < 10:  # 当剩余请求次数较少时发出警告
+                    print(f"{Colors.RED}警告: API 请求次数即将用尽！{Colors.ENDC}")
+                    
+                return remaining > 0
+        except Exception as e:
+            print(f"{Colors.RED}检查 API 速率限制时出错: {str(e)}{Colors.ENDC}")
+            return True  # 出错时默认继续执行
+
+    def get_with_retry(self, url, params=None, max_retries=3, retry_delay=5):
+        """带重试机制的 GET 请求"""
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, params=params)
+                
+                if response.status_code == 403 and 'rate limit exceeded' in response.text.lower():
+                    print(f"{Colors.RED}API 速率限制已达到，等待重置...{Colors.ENDC}")
+                    self.check_rate_limit()  # 显示限制信息
+                    return None
+                    
+                response.raise_for_status()
+                return response
+                
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    print(f"{Colors.YELLOW}请求失败，{retry_delay}秒后重试... ({attempt + 1}/{max_retries}){Colors.ENDC}")
+                    time.sleep(retry_delay)
+                else:
+                    print(f"{Colors.RED}请求失败，已达到最大重试次数{Colors.ENDC}")
+                    raise 
