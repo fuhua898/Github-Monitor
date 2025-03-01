@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Dict, List
 from queue import Queue
 import os
+import ssl
 
 # Windows系统启用ANSI支持
 if os.name == 'nt':
@@ -155,59 +156,25 @@ class GitHubMonitor:
         msg['To'] = self.email_config['receiver']
 
         try:
-            if 'qq.com' in self.email_config['smtp_server']:
-                # QQ邮箱使用SSL
-                server = smtplib.SMTP_SSL(
-                    self.email_config['smtp_server'], 
-                    self.email_config['smtp_port']
-                )
+            if self.email_config['smtp_port'] == 587:
+                # 使用 STARTTLS
+                server = smtplib.SMTP(self.email_config['smtp_server'], 587)
+                server.starttls()  # 升级到 TLS 连接
             else:
-                # Gmail等其他邮箱使用TLS
-                server = smtplib.SMTP(
-                    self.email_config['smtp_server'], 
-                    self.email_config['smtp_port']
-                )
-                server.starttls()
-
-            # 打印详细连接信息
-            print(f"正在连接到邮件服务器: {self.email_config['smtp_server']}:{self.email_config['smtp_port']}")
+                # 使用 SSL
+                server = smtplib.SMTP_SSL(self.email_config['smtp_server'], 465)
             
-            # 登录
-            print("正在尝试登录...")
+            # 登录并发送
             server.login(self.email_config['sender'], self.email_config['password'])
-            print("登录成功")
-            
-            # 发送邮件
-            print("正在发送邮件...")
-            server.sendmail(
-                self.email_config['sender'], 
-                [self.email_config['receiver']], 
-                msg.as_string()
-            )
-            
+            server.send_message(msg)
             server.quit()
+            
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"[{current_time}] 邮件发送成功: {subject}")
-            
-        except smtplib.SMTPAuthenticationError:
-            print("邮箱认证失败！可能的原因：")
-            print("1. 邮箱账号或密码错误")
-            print("2. 如果使用QQ邮箱，请确保使用的是授权码而不是邮箱密码")
-            print("3. 如果使用Gmail，请确保使用的是应用专用密码")
-            raise
-            
-        except smtplib.SMTPException as e:
-            print(f"SMTP错误: {str(e)}")
-            print("可能的原因：")
-            print("1. 邮箱服务器设置错误")
-            print("2. 端口配置错误")
-            print("3. 网络连接问题")
-            raise
             
         except Exception as e:
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"[{current_time}] 邮件发送失败: {str(e)}")
-            raise
 
     def check_user_activity(self, username):
         """检查用户活动，包括新建仓库和更新"""
@@ -219,30 +186,33 @@ class GitHubMonitor:
             current_repos = response.json()
             notifications = []
             
-            # 确保用户的无法访问仓库记录存在
-            if username not in self.inaccessible_repos:
-                self.inaccessible_repos[username] = []
-            
             # 获取当前所有仓库的最新状态
             current_state = {}
             for repo in current_repos:
                 repo_name = repo['name']
                 
-                # 跳过已知无法访问的仓库
-                if repo_name in self.inaccessible_repos[username]:
-                    continue
+                # 获取仓库的最后更新时间
+                last_updated = repo['updated_at']
                 
-                commits = self.get_repo_commits(username, repo_name, limit=1)
-                if commits is None:  # 如果获取失败
-                    self.inaccessible_repos[username].append(repo_name)
-                    continue
-                
-                if commits and commits[0]:
+                # 获取提交记录
+                commits = self.get_repo_commits(username, repo_name, limit=5)
+                if not commits:  # 如果获取失败，使用仓库的更新时间
                     current_state[repo_name] = {
                         'created_at': repo['created_at'],
-                        'last_commit': commits[0]['commit']['author']['date'],
-                        'html_url': repo['html_url']
+                        'updated_at': last_updated,
+                        'html_url': repo['html_url'],
+                        'has_commits': False
                     }
+                    continue
+                
+                # 记录仓库状态
+                current_state[repo_name] = {
+                    'created_at': repo['created_at'],
+                    'updated_at': last_updated,
+                    'html_url': repo['html_url'],
+                    'has_commits': True,
+                    'latest_commit': commits[0]['commit']['author']['date'] if commits else None
+                }
             
             # 首次运行时，只记录状态不发送通知
             if username not in self.known_repos:
@@ -259,14 +229,22 @@ class GitHubMonitor:
                         f"GitHub通知: {username} 创建了新仓库 {repo_name}",
                         f"新仓库信息:\n仓库名称: {repo_name}\n创建时间: {repo_state['created_at']}\n仓库地址: {repo_state['html_url']}"
                     ))
+                    continue
+                
                 # 检查更新
-                elif (repo_state['last_commit'] and 
-                      self.known_repos[username][repo_name].get('last_commit') and 
-                      repo_state['last_commit'] > self.known_repos[username][repo_name]['last_commit']):
-                    notifications.append((
-                        f"GitHub更新通知: {username}/{repo_name}",
-                        f"仓库有新的更新\n仓库地址: {repo_state['html_url']}\n最新提交时间: {repo_state['last_commit']}"
-                    ))
+                old_state = self.known_repos[username][repo_name]
+                
+                # 比较更新时间
+                if repo_state['updated_at'] > old_state['updated_at']:
+                    # 确认是真实更新
+                    if (repo_state['has_commits'] and 
+                        (not old_state.get('latest_commit') or 
+                         repo_state['latest_commit'] > old_state.get('latest_commit', ''))):
+                        notifications.append((
+                            f"GitHub更新通知: {username}/{repo_name}",
+                            f"仓库有新的更新\n仓库地址: {repo_state['html_url']}\n"
+                            f"更新时间: {repo_state['updated_at']}"
+                        ))
             
             # 更新状态
             self.known_repos[username] = current_state
